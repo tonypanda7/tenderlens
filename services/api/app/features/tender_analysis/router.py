@@ -292,3 +292,211 @@ async def get_tender(
             for c in criteria
         ],
     }
+
+
+@router.get("/{tender_id}/bidders")
+async def list_tender_bidders(
+    tender_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """List all bidders for a tender with their file counts and status."""
+    from app.shared.models import Bidder, IngestFile
+    from sqlalchemy import func
+
+    tender = await db.get(Tender, tender_id)
+    if not tender:
+        raise HTTPException(status_code=404, detail="Tender not found")
+
+    # Get bidders with file counts
+    result = await db.execute(
+        select(
+            Bidder,
+            func.count(IngestFile.id).label("files_count")
+        )
+        .outerjoin(IngestFile, IngestFile.bidder_id == Bidder.id)
+        .where(Bidder.tender_id == tender_id)
+        .group_by(Bidder.id)
+        .order_by(Bidder.created_at.desc())
+    )
+    rows = result.all()
+
+    return {
+        "tender_id": tender_id,
+        "bidders": [
+            {
+                "id": bidder.id,
+                "name": bidder.name,
+                "pseudonym_id": bidder.pseudonym_id,
+                "status": bidder.status,
+                "files_count": files_count,
+                "created_at": bidder.created_at.isoformat() if bidder.created_at else None,
+            }
+            for bidder, files_count in rows
+        ],
+    }
+
+
+@router.post("/{tender_id}/evaluate")
+async def evaluate_tender(
+    tender_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trigger the full evaluation pipeline for all bidders in a tender.
+    1. Ensures criteria are locked
+    2. Runs matching pipeline for each bidder
+    3. Scores and ranks all bidders
+    4. Returns ranking summary
+    """
+    from app.shared.models import Bidder, Verdict, BidderScore
+    from app.features.matching.tasks import run_matching_for_bidder
+    from app.features.scoring.engine import ScoringEngine
+    from app.features.scoring.rationale import RationaleGenerator
+
+    tender = await db.get(Tender, tender_id)
+    if not tender:
+        raise HTTPException(status_code=404, detail="Tender not found")
+
+    # Auto-lock if still in analysed state
+    if tender.status == "analysed":
+        result = await db.execute(
+            select(Criterion).where(Criterion.tender_id == tender_id)
+        )
+        criteria_list = result.scalars().all()
+        if not criteria_list:
+            raise HTTPException(status_code=400, detail="No criteria found. Analyse tender first.")
+
+        criterion_ids = sorted([c.criterion_id for c in criteria_list])
+        thresholds = sorted([json.dumps(c.threshold_json or {}) for c in criteria_list])
+        combined = "|".join(criterion_ids + thresholds)
+        lock_hash = hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+        for c in criteria_list:
+            c.status = "locked"
+        tender.lock_hash = lock_hash
+        tender.status = "locked"
+        await db.flush()
+
+    # Get criteria
+    result = await db.execute(
+        select(Criterion).where(Criterion.tender_id == tender_id)
+    )
+    criteria = result.scalars().all()
+    criteria_dicts = [
+        {
+            "criterion_id": c.criterion_id,
+            "text": c.text,
+            "type": c.type,
+            "mandatory": c.mandatory,
+            "threshold_json": c.threshold_json,
+            "weight": c.weight,
+            "source_section": c.source_section,
+            "source_page": c.source_page,
+        }
+        for c in criteria
+    ]
+
+    # Get all bidders
+    result = await db.execute(
+        select(Bidder).where(Bidder.tender_id == tender_id)
+    )
+    bidders = result.scalars().all()
+
+    if not bidders:
+        raise HTTPException(status_code=400, detail="No bidders found. Upload bidder documents first.")
+
+    # Run matching for each bidder (synchronous for now)
+    for bidder in bidders:
+        await run_matching_for_bidder(db, tender_id, bidder.id, criteria_dicts)
+
+    # Score all bidders
+    scoring_engine = ScoringEngine()
+    scored_bidders = []
+
+    # Build a reverse map: criterion DB id → criterion_id (e.g. "C1")
+    criterion_id_map = {}
+    for c in criteria:
+        criterion_id_map[c.id] = c.criterion_id
+
+    for bidder in bidders:
+        # Get verdicts for this bidder
+        from sqlalchemy.orm import joinedload
+        result = await db.execute(
+            select(Verdict)
+            .options(joinedload(Verdict.criterion))
+            .where(Verdict.bidder_id == bidder.id)
+        )
+        verdicts = result.scalars().unique().all()
+
+        verdict_dicts = [
+            {
+                "criterion_id": criterion_id_map.get(v.criterion_id, "unknown"),
+                "verdict": v.verdict,
+                "normalised_score": v.normalised_score,
+                "weighted_score": v.weighted_score,
+                "confidence": v.confidence,
+                "layer": v.layer,
+                "auto_approved": v.auto_approved,
+                "extracted_value": None,
+            }
+            for v in verdicts
+        ]
+
+        scored = scoring_engine.score_bidder(
+            bidder_id=bidder.id,
+            bidder_name=bidder.name,
+            verdicts=verdict_dicts,
+            criteria=criteria_dicts,
+        )
+        scored_bidders.append(scored)
+
+    # Rank
+    ranking_result = scoring_engine.rank_bidders(scored_bidders)
+
+    # Generate rationales
+    try:
+        rationale_gen = RationaleGenerator()
+        ranking_result["rankings"] = await rationale_gen.generate_rationales(
+            ranking_result["rankings"], tender.title
+        )
+    except Exception as e:
+        print(f"Rationale generation failed: {e}")
+
+    # Save scores to DB
+    for bidder_data in ranking_result["rankings"] + ranking_result["disqualified"]:
+        # Delete existing score
+        existing = await db.execute(
+            select(BidderScore).where(
+                BidderScore.bidder_id == bidder_data["bidder_id"],
+                BidderScore.tender_id == tender_id,
+            )
+        )
+        old = existing.scalar_one_or_none()
+        if old:
+            await db.delete(old)
+            await db.flush()
+
+        score_record = BidderScore(
+            bidder_id=bidder_data["bidder_id"],
+            tender_id=tender_id,
+            rank=bidder_data.get("rank"),
+            final_score=bidder_data.get("final_score", 0.0),
+            eligible=bidder_data.get("eligible", False),
+            disqualified=bidder_data.get("disqualified", False),
+            disqualify_reason=bidder_data.get("disqualify_reason"),
+            criterion_scores_json=bidder_data.get("criterion_scores"),
+            rationale=bidder_data.get("rationale"),
+        )
+        db.add(score_record)
+
+    tender.status = "evaluated"
+    await db.flush()
+
+    return {
+        "tender_id": tender_id,
+        "status": "evaluated",
+        "total_bidders": ranking_result["total_bidders"],
+        "eligible_count": ranking_result["eligible_count"],
+        "disqualified_count": ranking_result["disqualified_count"],
+        "message": f"Evaluation complete. {ranking_result['eligible_count']} eligible, {ranking_result['disqualified_count']} disqualified.",
+    }

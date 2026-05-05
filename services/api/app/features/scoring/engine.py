@@ -57,43 +57,43 @@ class ScoringEngine:
                 })
                 continue
 
-            # Normalise based on criterion type
-            ctype = criterion.get("type", "compliance")
+            # Get threshold and operator
             threshold = criterion.get("threshold_json", {}) or {}
+            operator = threshold.get("operator", "boolean_match")
+            ctype = criterion.get("type", "compliance")
 
-            if ctype == "financial":
-                bidder_value = self._extract_numeric(verdict.get("extracted_value"))
+            # If verdict already has normalised_score from matching pipeline, use it
+            normalised = verdict.get("normalised_score", 0.0)
+            formula = f"From matching pipeline: {verdict.get('verdict', 'unknown')}"
+
+            # If normalised_score is 0 but verdict is pass, recalculate
+            if normalised == 0.0 and verdict.get("verdict") == "pass":
+                normalised = 1.0
+                formula = "Verdict: pass → 1.0"
+
+            # For financial/technical criteria with numeric extracted values, try ratio scoring
+            extracted_value = verdict.get("extracted_value")
+            if ctype == "financial" and extracted_value is not None:
+                bidder_value = self._extract_numeric(str(extracted_value))
                 threshold_value = threshold.get("value", 0)
                 if isinstance(threshold_value, (int, float)) and threshold_value > 0 and bidder_value is not None:
-                    normalised, formula = self.normaliser.normalise_financial(
-                        bidder_value, threshold_value
+                    normalised, formula = self.normaliser.evaluate(
+                        operator=operator,
+                        bidder_value=bidder_value,
+                        threshold=threshold,
+                        criterion_type=ctype,
                     )
-                else:
-                    normalised = 1.0 if verdict.get("verdict") == "pass" else 0.0
-                    formula = f"Semantic verdict: {verdict.get('verdict')}"
 
-            elif ctype == "technical":
-                bidder_count = self._extract_count(verdict.get("extracted_value"))
-                required_count = threshold.get("value", 0)
-                if isinstance(required_count, (int, float)) and required_count > 0 and bidder_count is not None:
-                    normalised, formula = self.normaliser.normalise_technical(
-                        int(bidder_count), int(required_count)
+            elif ctype == "technical" and extracted_value is not None:
+                bidder_count = self._extract_count(str(extracted_value))
+                threshold_value = threshold.get("value", 0)
+                if isinstance(threshold_value, (int, float)) and threshold_value > 0 and bidder_count is not None:
+                    normalised, formula = self.normaliser.evaluate(
+                        operator=operator,
+                        bidder_value=bidder_count,
+                        threshold=threshold,
+                        criterion_type=ctype,
                     )
-                else:
-                    normalised = 1.0 if verdict.get("verdict") == "pass" else 0.0
-                    formula = f"Semantic verdict: {verdict.get('verdict')}"
-
-            elif ctype == "compliance":
-                passes = verdict.get("verdict") == "pass"
-                normalised, formula = self.normaliser.normalise_compliance(passes)
-
-            elif ctype == "conditional":
-                has_condition = verdict.get("verdict") == "pass"
-                normalised, formula, _ = self.normaliser.normalise_conditional(has_condition)
-
-            else:
-                normalised = 1.0 if verdict.get("verdict") == "pass" else 0.0
-                formula = f"Unknown type '{ctype}' — binary scoring"
 
             weighted = (criterion.get("weight", 0.0) / 100.0) * normalised * 100.0
 

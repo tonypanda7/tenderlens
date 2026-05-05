@@ -31,10 +31,14 @@ export const uploadDocuments = (formData) =>
 
 // ── Scoring endpoints ──
 export const getTenderRanking = (id) => api.get(`/tender/${id}/ranking`);
+export const triggerEvaluation = (id) => api.post(`/tender/${id}/evaluate`, {}, {
+  timeout: 600000, // 10 minutes — full pipeline can be slow
+});
 
 // ── Bidder endpoints ──
 export const triggerBidderParsing = (bidderId) => api.post(`/bidder/${bidderId}/parse`);
 export const getBidderBlocks = (bidderId) => api.get(`/bidder/${bidderId}/blocks`);
+export const getBiddersByTender = (tenderId) => api.get(`/tender/${tenderId}/bidders`);
 
 // ── Reviewer endpoints ──
 export const getReviewerQueue = (status) => api.get(`/reviewer/queue?status=${status || 'pending'}`);

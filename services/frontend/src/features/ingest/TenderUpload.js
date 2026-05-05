@@ -1,6 +1,6 @@
-import React, { useState, useCallback } from 'react';
-import { Upload, FileText, CheckCircle, AlertCircle } from 'lucide-react';
-import { createTender, uploadDocuments, analyseTender } from '../../api';
+import React, { useState, useCallback, useEffect } from 'react';
+import { Upload, FileText, CheckCircle, AlertCircle, FolderOpen, Users, Trash2, Play } from 'lucide-react';
+import { createTender, uploadDocuments, analyseTender, triggerEvaluation, getBiddersByTender } from '../../api';
 
 export default function TenderUpload() {
   const [step, setStep] = useState(1); // 1: Create, 2: Upload tender PDF, 3: Upload bidders
@@ -11,7 +11,28 @@ export default function TenderUpload() {
   const [bidderName, setBidderName] = useState('');
   const [bidderFiles, setBidderFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
+  const [evaluating, setEvaluating] = useState(false);
   const [messages, setMessages] = useState([]);
+  const [uploadedBidders, setUploadedBidders] = useState([]);
+
+  // Fetch existing bidders when tender is set and we're on step 3
+  useEffect(() => {
+    if (tenderId && step === 3) {
+      fetchBidders();
+    }
+  }, [tenderId, step]);
+
+  const fetchBidders = async () => {
+    try {
+      const res = await getBiddersByTender(tenderId);
+      if (res.data && res.data.bidders) {
+        setUploadedBidders(res.data.bidders);
+      }
+    } catch (err) {
+      // Silently fail — bidder list will just be empty
+      console.warn('Could not fetch bidders:', err.message);
+    }
+  };
 
   const handleCreateTender = async () => {
     if (!tenderTitle.trim()) return;
@@ -50,9 +71,25 @@ export default function TenderUpload() {
       formData.append('bidder_name', bidderName);
       bidderFiles.forEach(f => formData.append('files', f));
       const res = await uploadDocuments(formData);
-      addMessage('success', `Uploaded ${res.data.files.length} files for ${bidderName}`);
+      addMessage('success', `Uploaded ${res.data.files.length} files for "${bidderName}"`);
+
+      // Add to local bidder list
+      setUploadedBidders(prev => [...prev, {
+        id: res.data.bidder_id,
+        name: bidderName,
+        files_count: res.data.files.length,
+        status: 'pending',
+      }]);
+
+      // Clear form for next bidder
       setBidderName('');
       setBidderFiles([]);
+
+      // Reset the file inputs so user can select again
+      const fileInput = document.getElementById('bidder-files');
+      const folderInput = document.getElementById('bidder-folder');
+      if (fileInput) fileInput.value = '';
+      if (folderInput) folderInput.value = '';
     } catch (err) {
       addMessage('error', `Upload failed: ${err.message}`);
     } finally {
@@ -60,15 +97,57 @@ export default function TenderUpload() {
     }
   };
 
+  const handleEvaluateAll = async () => {
+    if (!tenderId || uploadedBidders.length === 0) return;
+    try {
+      setEvaluating(true);
+      addMessage('success', 'Evaluation started — this may take a few minutes...');
+      const res = await triggerEvaluation(tenderId);
+      addMessage('success', `Evaluation complete! ${res.data.message || 'Check the Ranking tab for results.'}`);
+    } catch (err) {
+      const detail = err.response?.data?.detail || err.message;
+      addMessage('error', `Evaluation failed: ${detail}`);
+    } finally {
+      setEvaluating(false);
+    }
+  };
+
   const addMessage = (type, text) => {
-    setMessages(prev => [{ type, text, id: Date.now() }, ...prev].slice(0, 5));
+    setMessages(prev => [{ type, text, id: Date.now() }, ...prev].slice(0, 8));
   };
 
   const onDrop = useCallback((e, setter) => {
     e.preventDefault();
     const files = Array.from(e.dataTransfer?.files || e.target?.files || []);
-    setter(files);
+    setter(prev => {
+      // Append new files, avoiding duplicates by name+size
+      const existingKeys = new Set(prev.map(f => `${f.name}_${f.size}`));
+      const newFiles = files.filter(f => !existingKeys.has(`${f.name}_${f.size}`));
+      return [...prev, ...newFiles];
+    });
   }, []);
+
+  const handleFileSelect = (e) => {
+    const files = Array.from(e.target.files || []);
+    setBidderFiles(prev => {
+      const existingKeys = new Set(prev.map(f => `${f.name}_${f.size}`));
+      const newFiles = files.filter(f => !existingKeys.has(`${f.name}_${f.size}`));
+      return [...prev, ...newFiles];
+    });
+  };
+
+  const handleFolderSelect = (e) => {
+    const files = Array.from(e.target.files || []);
+    setBidderFiles(prev => {
+      const existingKeys = new Set(prev.map(f => `${f.name}_${f.size}`));
+      const newFiles = files.filter(f => !existingKeys.has(`${f.name}_${f.size}`));
+      return [...prev, ...newFiles];
+    });
+  };
+
+  const removeFile = (index) => {
+    setBidderFiles(prev => prev.filter((_, i) => i !== index));
+  };
 
   return (
     <div>
@@ -156,35 +235,143 @@ export default function TenderUpload() {
 
       {/* Step 3: Upload Bidder Documents */}
       {step === 3 && (
-        <div className="card" style={{ maxWidth: '600px' }}>
-          <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '20px' }}>Add Bidder Documents</h3>
-          <div className="form-group">
-            <label className="form-label">Bidder / Company Name *</label>
-            <input className="form-input" placeholder="e.g. M/s Sharma Construction Pvt Ltd"
-              value={bidderName} onChange={e => setBidderName(e.target.value)} />
-          </div>
-          <div className="upload-zone" onDrop={e => onDrop(e, setBidderFiles)}
-            onDragOver={e => e.preventDefault()} onClick={() => document.getElementById('bidder-files').click()}>
-            <div className="upload-icon">📁</div>
-            <p><strong>Drop bidder documents here</strong></p>
-            <p style={{ fontSize: '12px', marginTop: '8px' }}>PDF, JPEG, PNG, DOCX — up to 50 files</p>
-            <p style={{ fontSize: '11px', marginTop: '4px', color: 'var(--text-muted)' }}>(You can repeat this process to add multiple companies)</p>
-            <input id="bidder-files" type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.docx" style={{ display: 'none' }}
-              onChange={e => setBidderFiles(Array.from(e.target.files))} />
-          </div>
-          {bidderFiles.length > 0 && (
-            <div style={{ marginTop: '12px', fontSize: '13px', color: 'var(--text-secondary)' }}>
-              {bidderFiles.length} file(s) selected
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', alignItems: 'start' }}>
+          {/* Left: Upload Form */}
+          <div className="card">
+            <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '20px' }}>Add Bidder Documents</h3>
+            <div className="form-group">
+              <label className="form-label">Bidder / Company Name *</label>
+              <input className="form-input" placeholder="e.g. M/s Sharma Construction Pvt Ltd"
+                value={bidderName} onChange={e => setBidderName(e.target.value)} />
             </div>
-          )}
-          <div style={{ display: 'flex', gap: '12px', marginTop: '20px' }}>
-            <button className="btn btn-primary" onClick={handleBidderUpload}
-              disabled={uploading || !bidderName.trim() || bidderFiles.length === 0}>
-              {uploading ? 'Uploading...' : 'Upload Bidder Bundle'}
-            </button>
-            <button className="btn btn-secondary" onClick={() => window.location.href = `/criteria?tender_id=${tenderId}`}>
-              Done — Review Criteria →
-            </button>
+
+            {/* File Upload Zone */}
+            <div className="upload-zone" onDrop={e => { e.preventDefault(); handleFileSelect(e); }}
+              onDragOver={e => e.preventDefault()} onClick={() => document.getElementById('bidder-files').click()}>
+              <div className="upload-icon">📁</div>
+              <p><strong>Drop bidder documents here</strong> or click to browse</p>
+              <p style={{ fontSize: '12px', marginTop: '8px' }}>PDF, JPEG, PNG, DOCX — up to 50 files</p>
+              <input id="bidder-files" type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.docx"
+                style={{ display: 'none' }} onChange={handleFileSelect} />
+            </div>
+
+            {/* Folder Upload Button */}
+            <div style={{ marginTop: '12px', display: 'flex', gap: '12px', alignItems: 'center' }}>
+              <button className="btn btn-secondary" onClick={() => document.getElementById('bidder-folder').click()}
+                style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <FolderOpen size={16} /> Upload Entire Folder
+              </button>
+              <input id="bidder-folder" type="file" webkitdirectory="true" directory=""
+                style={{ display: 'none' }} onChange={handleFolderSelect} />
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                Uploads all files from a folder
+              </span>
+            </div>
+
+            {/* Selected Files List */}
+            {bidderFiles.length > 0 && (
+              <div style={{ marginTop: '16px' }}>
+                <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px', color: 'var(--text-secondary)' }}>
+                  {bidderFiles.length} file(s) selected:
+                </div>
+                <div style={{ maxHeight: '160px', overflowY: 'auto', border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-md)', background: 'var(--bg-elevated)' }}>
+                  {bidderFiles.map((f, i) => (
+                    <div key={`${f.name}_${i}`} style={{
+                      padding: '6px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                      borderBottom: i < bidderFiles.length - 1 ? '1px solid var(--border)' : 'none',
+                      fontSize: '12px',
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
+                        <FileText size={12} color="var(--text-muted)" />
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {f.name}
+                        </span>
+                        <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>
+                          ({(f.size / 1024).toFixed(0)} KB)
+                        </span>
+                      </div>
+                      <button onClick={(e) => { e.stopPropagation(); removeFile(i); }}
+                        style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px', color: 'var(--danger)' }}>
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Upload Button */}
+            <div style={{ display: 'flex', gap: '12px', marginTop: '20px' }}>
+              <button className="btn btn-primary" onClick={handleBidderUpload}
+                disabled={uploading || !bidderName.trim() || bidderFiles.length === 0}>
+                {uploading ? 'Uploading...' : 'Upload Bidder Bundle'}
+              </button>
+            </div>
+          </div>
+
+          {/* Right: Uploaded Bidders List */}
+          <div>
+            <div className="card" style={{ marginBottom: '16px' }}>
+              <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Users size={18} color="var(--accent-primary)" />
+                Uploaded Bidders ({uploadedBidders.length})
+              </h3>
+
+              {uploadedBidders.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '32px 16px', color: 'var(--text-muted)' }}>
+                  <Users size={32} style={{ opacity: 0.3, marginBottom: '12px' }} />
+                  <p style={{ fontSize: '13px' }}>No bidders uploaded yet.</p>
+                  <p style={{ fontSize: '12px', marginTop: '4px' }}>Use the form on the left to add bidder documents.</p>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {uploadedBidders.map((bidder, i) => (
+                    <div key={bidder.id || i} style={{
+                      padding: '12px 16px', borderRadius: 'var(--radius-md)',
+                      border: '1px solid var(--border)', background: 'var(--bg-elevated)',
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    }}>
+                      <div>
+                        <div style={{ fontSize: '14px', fontWeight: 600 }}>{bidder.name}</div>
+                        <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                          {bidder.files_count} file(s) • ID: {bidder.id?.substring(0, 8)}...
+                        </div>
+                      </div>
+                      <span className={`badge ${bidder.status === 'parsed' ? 'pass' : bidder.status === 'parsing' ? 'review' : 'draft'}`}
+                        style={{ fontSize: '10px' }}>
+                        {bidder.status}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Evaluate Button */}
+            {uploadedBidders.length >= 1 && (
+              <div className="card" style={{
+                background: 'var(--accent-glow)', border: '1px solid var(--border-accent)',
+              }}>
+                <h4 style={{ fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Ready to Evaluate?</h4>
+                <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
+                  {uploadedBidders.length} bidder(s) uploaded. Click below to compare all bidders
+                  against the tender criteria and generate rankings.
+                </p>
+                <div style={{ display: 'flex', gap: '12px' }}>
+                  <button className="btn btn-primary" onClick={handleEvaluateAll}
+                    disabled={evaluating}
+                    style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Play size={16} />
+                    {evaluating ? 'Evaluating...' : 'Evaluate All Bidders'}
+                  </button>
+                  <button className="btn btn-secondary"
+                    onClick={() => window.location.href = `/ranking?tender_id=${tenderId}`}>
+                    View Rankings →
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
