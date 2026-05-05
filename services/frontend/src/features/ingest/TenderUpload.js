@@ -29,11 +29,13 @@ export default function TenderUpload() {
     if (!tenderId) return;
     try {
       setUploading(true);
-      const res = await analyseTender(tenderId);
+      const file = tenderFiles.length > 0 ? tenderFiles[0] : null;
+      const res = await analyseTender(tenderId, file);
       addMessage('success', `Extracted ${res.data.criteria_count} criteria from tender PDF`);
       setStep(3);
     } catch (err) {
-      addMessage('error', `Analysis failed: ${err.message}`);
+      const detail = err.response?.data?.detail || err.message;
+      addMessage('error', `Analysis failed: ${detail}`);
     } finally {
       setUploading(false);
     }
@@ -140,8 +142,13 @@ export default function TenderUpload() {
               <span style={{ fontSize: '13px' }}>{tenderFiles[0].name}</span>
             </div>
           )}
+          {tenderFiles.length === 0 && (
+            <div style={{ marginTop: '12px', fontSize: '12px', color: 'var(--danger)', fontStyle: 'italic' }}>
+              ⚠ Please select a tender PDF document before proceeding
+            </div>
+          )}
           <button className="btn btn-primary" style={{ marginTop: '20px' }}
-            onClick={handleAnalyse} disabled={uploading}>
+            onClick={handleAnalyse} disabled={uploading || tenderFiles.length === 0}>
             {uploading ? 'Analysing...' : 'Upload & Extract Criteria'}
           </button>
         </div>
@@ -161,6 +168,7 @@ export default function TenderUpload() {
             <div className="upload-icon">📁</div>
             <p><strong>Drop bidder documents here</strong></p>
             <p style={{ fontSize: '12px', marginTop: '8px' }}>PDF, JPEG, PNG, DOCX — up to 50 files</p>
+            <p style={{ fontSize: '11px', marginTop: '4px', color: 'var(--text-muted)' }}>(You can repeat this process to add multiple companies)</p>
             <input id="bidder-files" type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.docx" style={{ display: 'none' }}
               onChange={e => setBidderFiles(Array.from(e.target.files))} />
           </div>
@@ -174,7 +182,7 @@ export default function TenderUpload() {
               disabled={uploading || !bidderName.trim() || bidderFiles.length === 0}>
               {uploading ? 'Uploading...' : 'Upload Bidder Bundle'}
             </button>
-            <button className="btn btn-secondary" onClick={() => window.location.href = '/criteria'}>
+            <button className="btn btn-secondary" onClick={() => window.location.href = `/criteria?tender_id=${tenderId}`}>
               Done — Review Criteria →
             </button>
           </div>

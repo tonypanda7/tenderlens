@@ -9,8 +9,16 @@ const api = axios.create({
 
 // ── Tender endpoints ──
 export const createTender = (data) => api.post('/tender/create', data);
+export const getTenders = () => api.get('/tender/');
 export const getTender = (id) => api.get(`/tender/${id}`);
-export const analyseTender = (id) => api.post(`/tender/${id}/analyse`);
+export const analyseTender = (id, file) => {
+  const formData = new FormData();
+  if (file) formData.append('file', file);
+  return api.post(`/tender/${id}/analyse`, formData, {
+    headers: { 'Content-Type': undefined },
+    timeout: 600000, // 10 minutes — Gemini extraction can be slow for large tenders
+  });
+};
 export const lockTender = (id) => api.post(`/tender/${id}/lock`);
 export const updateCriterion = (tenderId, criterionId, data) =>
   api.put(`/tender/${tenderId}/criteria/${criterionId}`, data);

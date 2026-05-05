@@ -41,16 +41,35 @@ class TenderCriterionExtractor:
         prompt = self._build_extraction_prompt(tender_text)
 
         try:
-            response = await self.client.aio.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                ),
-            )
+            import asyncio as _asyncio
+
+            last_error = None
+            for attempt in range(settings.gemini_max_retries):
+                try:
+                    response = await self.client.aio.models.generate_content(
+                        model=self.model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.1,
+                            response_mime_type="application/json",
+                        ),
+                    )
+                    last_error = None
+                    break  # Success
+                except Exception as retry_err:
+                    last_error = retry_err
+                    err_str = str(retry_err)
+                    if "503" in err_str or "UNAVAILABLE" in err_str or "overloaded" in err_str.lower():
+                        wait = 2 ** attempt  # 1s, 2s, 4s, 8s
+                        await _asyncio.sleep(wait)
+                        continue
+                    raise  # Non-retryable error
+
+            if last_error:
+                raise last_error
 
             raw_criteria = json.loads(response.text)
+            print(f"DEBUG extractor: raw Gemini response type={type(raw_criteria)}, preview={str(raw_criteria)[:500]}")
 
             # Validate each criterion against Pydantic schema
             validated_criteria = []
@@ -60,6 +79,8 @@ class TenderCriterionExtractor:
                 criteria_list = raw_criteria
             else:
                 criteria_list = []
+
+            print(f"DEBUG extractor: found {len(criteria_list)} raw criteria from Gemini")
 
             for c in criteria_list:
                 try:
@@ -81,8 +102,11 @@ class TenderCriterionExtractor:
                         ambiguity_note=c.get("ambiguity_note"),
                     )
                     validated_criteria.append(criterion)
-                except Exception:
+                except Exception as val_err:
+                    print(f"DEBUG extractor: validation error for criterion {c.get('criterion_id', '?')}: {val_err}")
                     continue  # Skip malformed criteria
+
+            print(f"DEBUG extractor: validated {len(validated_criteria)} criteria")
 
             return {
                 "tender_id": tender_id,
@@ -92,6 +116,7 @@ class TenderCriterionExtractor:
             }
 
         except Exception as e:
+            print(f"DEBUG extractor: EXCEPTION: {e}")
             return {
                 "tender_id": tender_id,
                 "prompt_version": self.prompt_version,

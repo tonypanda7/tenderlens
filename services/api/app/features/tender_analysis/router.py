@@ -5,12 +5,13 @@ POST /api/v1/tender/{id}/lock
 """
 
 import hashlib
+import io
 import json
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from app.shared.database import get_db
 from app.shared.models import Tender, Criterion
@@ -35,16 +36,32 @@ async def create_tender(
     await db.flush()
 
     return {"id": new_tender.id, "title": new_tender.title, "status": "draft"}
+@router.get("/")
+async def list_tenders(db: AsyncSession = Depends(get_db)):
+    """List all tenders, ordered by newest first."""
+    result = await db.execute(select(Tender).order_by(Tender.created_at.desc()))
+    tenders = result.scalars().all()
+    return [
+        {
+            "id": t.id,
+            "title": t.title,
+            "status": t.status,
+            "created_at": t.created_at,
+        }
+        for t in tenders
+    ]
 
 
 @router.post("/{tender_id}/analyse")
 async def analyse_tender(
     tender_id: str,
+    file: UploadFile = File(None),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Trigger Gemini 2.5 Flash to extract criteria from the tender PDF.
-    Reads PDF from MinIO, sends to Gemini, stores criteria as draft.
+    Accepts an optional PDF file upload. Extracts text using TypedPdfParser,
+    stores the PDF in MinIO, sends text to Gemini, and stores criteria as draft.
     """
     tender = await db.get(Tender, tender_id)
     if not tender:
@@ -56,15 +73,71 @@ async def analyse_tender(
             detail=f"Cannot re-analyse tender in status '{tender.status}'",
         )
 
-    # TODO: Read tender PDF text from MinIO
-    # For now, this is a placeholder
-    tender_text = "Sample tender text — replace with MinIO PDF read"
+    # Extract text from uploaded PDF
+    tender_text = ""
+    print(f"DEBUG analyse: file={file}, filename={getattr(file, 'filename', None)}, size={getattr(file, 'size', None)}")
+    if file and file.filename:
+        pdf_bytes = await file.read()
+        print(f"DEBUG analyse: read {len(pdf_bytes)} bytes from uploaded file '{file.filename}'")
+
+        # Store the tender PDF in MinIO
+        try:
+            from app.shared.storage import storage_client
+            minio_path = f"tenders/{tender_id}/tender_document/{file.filename}"
+            storage_client.upload_file(
+                file_data=pdf_bytes,
+                object_name=minio_path,
+                content_type=file.content_type or "application/pdf",
+            )
+        except Exception as e:
+            print(f"DEBUG analyse: MinIO upload failed: {e}")
+
+        # Extract text using TypedPdfParser
+        from app.features.bidder_parsing.parsers import TypedPdfParser
+        parser = TypedPdfParser()
+        pages_data, _ = parser.parse(pdf_bytes)
+        for page in pages_data:
+            for block in page.get("blocks", []):
+                tender_text += block.get("text", "") + "\n"
+        print(f"DEBUG analyse: pdfplumber extracted {len(tender_text)} chars from {len(pages_data)} pages")
+
+        # Fallback to PyMuPDF if pdfplumber extracted nothing or very little
+        if len(tender_text.strip()) < 50:
+            import fitz
+            try:
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                tender_text = "\n".join(page.get_text() for page in doc)
+                print(f"DEBUG analyse: PyMuPDF fallback extracted {len(tender_text)} chars")
+            except Exception as e:
+                print(f"DEBUG analyse: PyMuPDF fallback failed: {e}")
+
+        if len(tender_text.strip()) < 50:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract text from the uploaded PDF. Please ensure you are uploading a searchable/typed PDF and not a scanned image."
+            )
+    else:
+        print("DEBUG analyse: no file uploaded, using title/description fallback")
+
+    if not tender_text.strip():
+        # This only happens if they didn't upload a file at all
+        tender_text = f"Tender Title: {tender.title}\nDescription: {tender.description or 'No description provided.'}"
+
+    print(f"DEBUG analyse: final tender_text length = {len(tender_text)}, snippet: {tender_text[:300]}")
 
     extractor = TenderCriterionExtractor()
     result = await extractor.extract_criteria(tender_text, tender_id)
 
     if "error" in result:
-        raise HTTPException(status_code=500, detail=result["error"])
+        print(f"DEBUG: extractor error = {result['error']}")
+        error_msg = result["error"]
+        status_code = 503 if "503" in error_msg or "UNAVAILABLE" in error_msg else 500
+        raise HTTPException(status_code=status_code, detail=error_msg)
+
+    # Delete existing criteria for this tender (supports re-analysis)
+    await db.execute(
+        delete(Criterion).where(Criterion.tender_id == tender_id)
+    )
 
     # Store extracted criteria in DB
     for c in result["criteria"]:

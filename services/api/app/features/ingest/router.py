@@ -112,8 +112,13 @@ async def upload_documents(
         # MinIO path
         minio_path = f"tenders/{tender_id}/bidders/{bidder.id}/{sha256}/{upload_file.filename}"
 
-        # TODO: Upload to MinIO via minio client
-        # For now, store the path reference
+        # Upload to MinIO via minio client
+        from app.shared.storage import storage_client
+        storage_client.upload_file(
+            file_data=content,
+            object_name=minio_path,
+            content_type=upload_file.content_type
+        )
 
         # Create DB record
         file_record = IngestFile(
@@ -136,9 +141,9 @@ async def upload_documents(
             minio_path=minio_path,
         ))
 
-    # TODO: Trigger Celery task for async document processing
-    # from app.features.bidder_parsing.tasks import parse_bidder_documents
-    # parse_bidder_documents.delay(bidder.id)
+    # Trigger Celery task for async document processing
+    from app.features.bidder_parsing.tasks import parse_bidder_documents
+    parse_bidder_documents.delay(bidder.id)
 
     return IngestResponse(
         bidder_id=bidder.id,

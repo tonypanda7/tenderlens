@@ -1,48 +1,45 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Lock, Unlock, Edit3, AlertTriangle, Check } from 'lucide-react';
+import { getTender, getTenders } from '../../api';
 
 export default function CriteriaReview() {
   const [isLocked, setIsLocked] = useState(false);
+  const [criteria, setCriteria] = useState([]);
+  const [tender, setTender] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
-  // Sample extracted criteria matching PRD Section 4.2 JSON schema
-  const [criteria, setCriteria] = useState([
-    {
-      criterion_id: 'C1', text: 'Average annual turnover for last 3 financial years',
-      type: 'financial', mandatory: true, weight: 35, source_section: 'Section 4.1',
-      source_page: 7, ambiguous: false,
-      threshold: { value: 5, unit: 'crore_inr', period: 'FY22-FY24', operator: 'gte' },
-    },
-    {
-      criterion_id: 'C2', text: 'Minimum 3 similar works completed in last 5 years',
-      type: 'technical', mandatory: true, weight: 35, source_section: 'Section 4.2',
-      source_page: 7, ambiguous: false,
-      threshold: { value: 3, unit: 'works', each_value: 1.5, each_unit: 'crore_inr', operator: 'gte' },
-    },
-    {
-      criterion_id: 'C3', text: 'Valid GST registration',
-      type: 'compliance', mandatory: true, weight: 20, source_section: 'Section 4.3',
-      source_page: 8, ambiguous: false,
-      threshold: { value: 'active_gstin', operator: 'eq' },
-    },
-    {
-      criterion_id: 'C4', text: 'ISO 9001:2015 certification — NABCB accredited',
-      type: 'compliance', mandatory: true, weight: 0, source_section: 'Section 4.3',
-      source_page: 8, ambiguous: false,
-      threshold: { value: 'valid_nabcb', operator: 'eq' },
-    },
-    {
-      criterion_id: 'C5', text: 'Defence sector experience',
-      type: 'technical', mandatory: false, weight: 10, source_section: 'Section 4.5',
-      source_page: 9, ambiguous: false,
-      threshold: null,
-    },
-    {
-      criterion_id: 'C6', text: 'MSME registration',
-      type: 'conditional', mandatory: false, weight: 0, source_section: 'Section 4.6',
-      source_page: 9, ambiguous: false,
-      threshold: { effect: 'exempts_C1_turnover_threshold', operator: 'modifier' },
-    },
-  ]);
+  useEffect(() => {
+    const fetchTenderData = async () => {
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        let tenderId = urlParams.get('tender_id');
+
+        if (!tenderId) {
+          // Fetch latest tender
+          const listRes = await getTenders();
+          if (listRes.data && listRes.data.length > 0) {
+            tenderId = listRes.data[0].id;
+          } else {
+            setLoading(false);
+            return;
+          }
+        }
+
+        const res = await getTender(tenderId);
+        setTender(res.data);
+        setCriteria(res.data.criteria || []);
+        setIsLocked(res.data.status === 'locked' || res.data.status === 'evaluated');
+        setLoading(false);
+      } catch (err) {
+        console.error("Failed to fetch criteria:", err);
+        setError("Failed to load tender data. Please try again.");
+        setLoading(false);
+      }
+    };
+
+    fetchTenderData();
+  }, []);
 
   const typeColors = {
     financial: 'var(--success)',
@@ -57,7 +54,7 @@ export default function CriteriaReview() {
     <div>
       <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
-          <h2>Criterion Registry</h2>
+          <h2>Criterion Registry {tender && `— ${tender.title}`}</h2>
           <p>Extracted from tender PDF by Gemini 2.5 Flash — review and lock before evaluation</p>
         </div>
         <button className={`btn ${isLocked ? 'btn-secondary' : 'btn-primary'}`}
@@ -90,6 +87,14 @@ export default function CriteriaReview() {
         </div>
       </div>
 
+      {loading ? (
+        <div style={{ textAlign: 'center', padding: '40px' }}>Loading criteria...</div>
+      ) : error ? (
+        <div style={{ color: 'var(--danger)', padding: '20px' }}>{error}</div>
+      ) : criteria.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>No criteria found for this tender.</div>
+      ) : (
+      <>
       {/* Criteria Table */}
       <div className="table-container">
         <table>
@@ -169,6 +174,8 @@ export default function CriteriaReview() {
           </tbody>
         </table>
       </div>
+      </>
+      )}
     </div>
   );
 }
