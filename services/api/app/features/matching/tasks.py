@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery_app import celery_app
-from app.shared.models import Bidder, IngestFile, OcrBlock, Criterion, Verdict, Extraction
+from app.shared.models import Bidder, IngestFile, OcrBlock, Criterion, Verdict, Extraction, ReviewerQueueItem, BidderScore
 from app.features.matching.engine import (
     DeterministicMatcher, NormalisationEngine, ConfidenceRouter, ComputationMatcher
 )
@@ -97,69 +97,22 @@ async def run_matching_for_bidder(
         layer = "deterministic"
         source_page = None
 
-        # ── STAGE 1: Deterministic Pre-Filter ──
-        if operator == "boolean_match":
-            # Check document presence or text-based boolean
-            keyword = _extract_keyword_from_criterion(criterion_text)
-            found, conf, detail = _search_text_for_keyword(all_text, keyword)
-            extracted_value = "found" if found else "not found"
-            confidence = conf
-            layer = "deterministic"
-
-        elif operator in ("gte", "lte", "eq", "between"):
-            # Extract numeric value from text
-            numeric_val = _extract_numeric_from_text(all_text, criterion_text, threshold)
-            if numeric_val is not None:
-                extracted_value = str(numeric_val)
-                confidence = 0.85
-                layer = "deterministic"
-            else:
-                extracted_value = "0"
-                confidence = 0.40
-                layer = "deterministic"
-
-        elif operator == "eq_string":
-            # Look for exact string match
-            target_value = str(threshold.get("value", ""))
-            if target_value.lower() in all_text.lower():
-                extracted_value = target_value
-                confidence = 0.95
-            else:
-                extracted_value = ""
-                confidence = 0.70
-            layer = "deterministic"
-
-        elif operator == "semantic_match":
-            # ── STAGE 2: Semantic Matching via Gemini ──
-            try:
-                from app.features.matching.semantic import semantic_matcher
-                result_match = await semantic_matcher.compare(
-                    tender_requirement=criterion_text,
-                    bidder_value=all_text[:5000],  # Limit context window
-                )
-                extracted_value = result_match
-                confidence = result_match.get("confidence", 0.0)
-                layer = "semantic"
-            except Exception as e:
-                extracted_value = {"match": False, "confidence": 0.0, "reasoning": str(e)}
-                confidence = 0.0
-                layer = "semantic"
-
-        elif operator == "modifier":
-            # Conditional criteria — check if condition exists
-            keyword = _extract_keyword_from_criterion(criterion_text)
-            found, conf, detail = _search_text_for_keyword(all_text, keyword)
-            extracted_value = "true" if found else "false"
-            confidence = conf
-            layer = "deterministic"
-
-        else:
-            # Fallback: try text search
-            keyword = _extract_keyword_from_criterion(criterion_text)
-            found, conf, detail = _search_text_for_keyword(all_text, keyword)
-            extracted_value = "found" if found else "not found"
-            confidence = conf
-            layer = "deterministic"
+        # ── STAGE 1: Semantic Matching via Gemini (Replacing Deterministic) ──
+        try:
+            from app.features.matching.semantic import semantic_matcher
+            result_match = await semantic_matcher.compare(
+                tender_requirement=criterion_text,
+                bidder_value=all_text[:15000],  # Increased context window
+            )
+            extracted_value = result_match
+            confidence = result_match.get("confidence", 0.0)
+            layer = "semantic"
+            operator = "semantic_match"  # Force NormalisationEngine to treat it as a semantic result
+        except Exception as e:
+            extracted_value = {"match": False, "confidence": 0.0, "reasoning": str(e)}
+            confidence = 0.0
+            layer = "semantic"
+            operator = "semantic_match"
 
         # ── STAGE 3: Normalise score using the operator ──
         normalised_score, formula = normaliser.evaluate(
@@ -196,6 +149,17 @@ async def run_matching_for_bidder(
             auto_approved=routing["auto_approved"],
         )
         db.add(verdict)
+        await db.flush()
+
+        # Create ReviewerQueueItem for low-confidence verdicts
+        if confidence < 0.60:
+            queue_item = ReviewerQueueItem(
+                verdict_id=verdict.id,
+                status="pending",
+                flag_reason=f"Low confidence ({confidence:.2f}) for criterion {cid}: {criterion_text[:80]}",
+                priority=1 if mandatory else 0,
+            )
+            db.add(queue_item)
 
     await db.flush()
 
@@ -314,6 +278,9 @@ def run_matching_pipeline(tender_id: str, bidder_id: str):
     """
     import asyncio
     from app.shared.database import async_session
+    from app.features.scoring.engine import ScoringEngine
+    from app.features.scoring.rationale import RationaleGenerator
+    from sqlalchemy.orm import joinedload
 
     async def _run():
         async with async_session() as db:
@@ -333,7 +300,96 @@ def run_matching_pipeline(tender_id: str, bidder_id: str):
                 }
                 for c in criteria
             ]
+
+            # Build criterion_id_map for verdicts
+            criterion_id_map = {c.id: c.criterion_id for c in criteria}
+
             await run_matching_for_bidder(db, tender_id, bidder_id, criteria_dicts)
+            await db.flush()
+
+            # ── Score and persist BidderScore ──
+            bidder = await db.get(Bidder, bidder_id)
+            if not bidder:
+                await db.commit()
+                return
+
+            # Load verdicts for this bidder
+            vresult = await db.execute(
+                select(Verdict)
+                .options(joinedload(Verdict.criterion))
+                .where(Verdict.bidder_id == bidder_id)
+            )
+            verdicts = vresult.scalars().unique().all()
+
+            verdict_dicts = [
+                {
+                    "criterion_id": criterion_id_map.get(v.criterion_id, "unknown"),
+                    "verdict": v.verdict,
+                    "normalised_score": v.normalised_score,
+                    "weighted_score": v.weighted_score,
+                    "confidence": v.confidence,
+                    "layer": v.layer,
+                    "auto_approved": v.auto_approved,
+                    "extracted_value": None,
+                }
+                for v in verdicts
+            ]
+
+            scoring_engine = ScoringEngine()
+            scored = scoring_engine.score_bidder(
+                bidder_id=bidder_id,
+                bidder_name=bidder.name,
+                verdicts=verdict_dicts,
+                criteria=criteria_dicts,
+            )
+
+            # Delete existing score if re-evaluating
+            existing = await db.execute(
+                select(BidderScore).where(
+                    BidderScore.bidder_id == bidder_id,
+                    BidderScore.tender_id == tender_id,
+                )
+            )
+            old = existing.scalar_one_or_none()
+            if old:
+                await db.delete(old)
+                await db.flush()
+
+            # Rank as single bidder (rank will be updated when full ranking is requested)
+            ranking_result = scoring_engine.rank_bidders([scored])
+            bidder_data = ranking_result["rankings"][0] if ranking_result["rankings"] else (
+                ranking_result["disqualified"][0] if ranking_result["disqualified"] else scored
+            )
+
+            # Try rationale generation
+            try:
+                from app.config import settings as app_settings
+                if app_settings.gemini_api_key:
+                    from app.shared.models import Tender
+                    rationale_gen = RationaleGenerator()
+                    tender_obj = await db.get(Tender, tender_id)
+                    if ranking_result["rankings"] and tender_obj:
+                        ranking_result["rankings"] = await rationale_gen.generate_rationales(
+                            ranking_result["rankings"],
+                            tender_obj.title,
+                        )
+                        bidder_data = ranking_result["rankings"][0]
+            except Exception as e:
+                print(f"Rationale generation failed in pipeline: {e}")
+
+            score_record = BidderScore(
+                bidder_id=bidder_id,
+                tender_id=tender_id,
+                rank=bidder_data.get("rank"),
+                final_score=bidder_data.get("final_score", 0.0),
+                eligible=bidder_data.get("eligible", False),
+                disqualified=bidder_data.get("disqualified", False),
+                disqualify_reason=bidder_data.get("disqualify_reason"),
+                criterion_scores_json=bidder_data.get("criterion_scores"),
+                rationale=bidder_data.get("rationale"),
+            )
+            db.add(score_record)
+
             await db.commit()
 
     asyncio.run(_run())

@@ -39,7 +39,37 @@ async def _async_parse_bidder_documents(bidder_id: str):
                 pages_data, needs_ocr = parser.parse(file_bytes)
                 
                 if needs_ocr:
-                    # Fall back to scanned parser
+                    # Try OCR, but fall back to typed PDF blocks if OCR is unavailable
+                    try:
+                        scanner = ScannedPdfParser()
+                        images = scanner.extract_page_images(file_bytes)
+                        ocr_reqs = [
+                            {
+                                "image_bytes": img["image_bytes"],
+                                "doc_type": "scanned",
+                                "bidder_id": bidder_id,
+                                "page_number": img["page_number"],
+                                "file_id": f.id
+                            } for img in images
+                        ]
+                        ocr_responses = await ocr_client.extract_batch(ocr_reqs)
+                        for resp in ocr_responses:
+                            if not isinstance(resp, Exception):
+                                for b in resp.blocks:
+                                    blocks_to_save.append(b.dict() | {"page_number": resp.page_number})
+                    except (RuntimeError, Exception) as e:
+                        print(f"OCR unavailable for typed_pdf {f.id}, using typed text blocks: {e}")
+                        # Graceful fallback: use whatever typed text we extracted
+                        for page in pages_data:
+                            for b in page["blocks"]:
+                                blocks_to_save.append(b)
+                else:
+                    for page in pages_data:
+                        for b in page["blocks"]:
+                            blocks_to_save.append(b)
+
+            elif format_detected == "scanned":
+                try:
                     parser = ScannedPdfParser()
                     images = parser.extract_page_images(file_bytes)
                     ocr_reqs = [
@@ -56,41 +86,24 @@ async def _async_parse_bidder_documents(bidder_id: str):
                         if not isinstance(resp, Exception):
                             for b in resp.blocks:
                                 blocks_to_save.append(b.dict() | {"page_number": resp.page_number})
-                else:
-                    for page in pages_data:
-                        for b in page["blocks"]:
-                            blocks_to_save.append(b)
-
-            elif format_detected == "scanned":
-                parser = ScannedPdfParser()
-                images = parser.extract_page_images(file_bytes)
-                ocr_reqs = [
-                    {
-                        "image_bytes": img["image_bytes"],
-                        "doc_type": "scanned",
-                        "bidder_id": bidder_id,
-                        "page_number": img["page_number"],
-                        "file_id": f.id
-                    } for img in images
-                ]
-                ocr_responses = await ocr_client.extract_batch(ocr_reqs)
-                for resp in ocr_responses:
-                    if not isinstance(resp, Exception):
-                        for b in resp.blocks:
-                            blocks_to_save.append(b.dict() | {"page_number": resp.page_number})
+                except (RuntimeError, Exception) as e:
+                    print(f"OCR unavailable for scanned {f.id}, skipping: {e}")
                             
             elif format_detected == "photo":
-                parser = PhotoParser()
-                processed_bytes = parser.prepare(file_bytes)
-                resp = await ocr_client.extract(
-                    image_bytes=processed_bytes,
-                    doc_type="photo",
-                    bidder_id=bidder_id,
-                    page_number=0,
-                    file_id=f.id
-                )
-                for b in resp.blocks:
-                    blocks_to_save.append(b.dict() | {"page_number": resp.page_number})
+                try:
+                    parser = PhotoParser()
+                    processed_bytes = parser.prepare(file_bytes)
+                    resp = await ocr_client.extract(
+                        image_bytes=processed_bytes,
+                        doc_type="photo",
+                        bidder_id=bidder_id,
+                        page_number=0,
+                        file_id=f.id
+                    )
+                    for b in resp.blocks:
+                        blocks_to_save.append(b.dict() | {"page_number": resp.page_number})
+                except (RuntimeError, Exception) as e:
+                    print(f"OCR unavailable for photo {f.id}, skipping: {e}")
                     
             elif format_detected == "docx" or format_detected == "unknown":
                 parser = DocxParser()

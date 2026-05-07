@@ -382,21 +382,11 @@ async def evaluate_tender(
         select(Criterion).where(Criterion.tender_id == tender_id)
     )
     criteria = result.scalars().all()
-    criteria_dicts = [
-        {
-            "criterion_id": c.criterion_id,
-            "text": c.text,
-            "type": c.type,
-            "mandatory": c.mandatory,
-            "threshold_json": c.threshold_json,
-            "weight": c.weight,
-            "source_section": c.source_section,
-            "source_page": c.source_page,
-        }
-        for c in criteria
-    ]
+    criteria_list = [f"- {c.text}" for c in criteria]
+    criteria_text = "\n".join(criteria_list)
 
     # Get all bidders
+    from app.shared.models import Bidder, IngestFile, OcrBlock
     result = await db.execute(
         select(Bidder).where(Bidder.tender_id == tender_id)
     )
@@ -405,98 +395,57 @@ async def evaluate_tender(
     if not bidders:
         raise HTTPException(status_code=400, detail="No bidders found. Upload bidder documents first.")
 
-    # Run matching for each bidder (synchronous for now)
-    for bidder in bidders:
-        await run_matching_for_bidder(db, tender_id, bidder.id, criteria_dicts)
-
-    # Score all bidders
-    scoring_engine = ScoringEngine()
-    scored_bidders = []
-
-    # Build a reverse map: criterion DB id → criterion_id (e.g. "C1")
-    criterion_id_map = {}
-    for c in criteria:
-        criterion_id_map[c.id] = c.criterion_id
-
-    for bidder in bidders:
-        # Get verdicts for this bidder
-        from sqlalchemy.orm import joinedload
-        result = await db.execute(
-            select(Verdict)
-            .options(joinedload(Verdict.criterion))
-            .where(Verdict.bidder_id == bidder.id)
-        )
-        verdicts = result.scalars().unique().all()
-
-        verdict_dicts = [
-            {
-                "criterion_id": criterion_id_map.get(v.criterion_id, "unknown"),
-                "verdict": v.verdict,
-                "normalised_score": v.normalised_score,
-                "weighted_score": v.weighted_score,
-                "confidence": v.confidence,
-                "layer": v.layer,
-                "auto_approved": v.auto_approved,
-                "extracted_value": None,
-            }
-            for v in verdicts
-        ]
-
-        scored = scoring_engine.score_bidder(
-            bidder_id=bidder.id,
-            bidder_name=bidder.name,
-            verdicts=verdict_dicts,
-            criteria=criteria_dicts,
-        )
-        scored_bidders.append(scored)
-
-    # Rank
-    ranking_result = scoring_engine.rank_bidders(scored_bidders)
-
-    # Generate rationales
-    try:
-        rationale_gen = RationaleGenerator()
-        ranking_result["rankings"] = await rationale_gen.generate_rationales(
-            ranking_result["rankings"], tender.title
-        )
-    except Exception as e:
-        print(f"Rationale generation failed: {e}")
-
-    # Save scores to DB
-    for bidder_data in ranking_result["rankings"] + ranking_result["disqualified"]:
-        # Delete existing score
-        existing = await db.execute(
-            select(BidderScore).where(
-                BidderScore.bidder_id == bidder_data["bidder_id"],
-                BidderScore.tender_id == tender_id,
+    bidders_data = []
+    for b in bidders:
+        files_res = await db.execute(select(IngestFile).where(IngestFile.bidder_id == b.id))
+        file_ids = [f.id for f in files_res.scalars().all()]
+        
+        all_text = ""
+        if file_ids:
+            blocks_res = await db.execute(
+                select(OcrBlock).where(OcrBlock.file_id.in_(file_ids)).order_by(OcrBlock.page_number)
             )
-        )
-        old = existing.scalar_one_or_none()
-        if old:
-            await db.delete(old)
-            await db.flush()
+            blocks = blocks_res.scalars().all()
+            all_text = "\n".join([block.text for block in blocks])
+            
+        bidders_data.append(f"=== BIDDER: {b.name} ===\nTEXT EXTRACTED FROM BID DOCUMENTS:\n{all_text[:20000]}\n")
+        
+    all_bidders_text = "\n\n".join(bidders_data)
 
-        score_record = BidderScore(
-            bidder_id=bidder_data["bidder_id"],
-            tender_id=tender_id,
-            rank=bidder_data.get("rank"),
-            final_score=bidder_data.get("final_score", 0.0),
-            eligible=bidder_data.get("eligible", False),
-            disqualified=bidder_data.get("disqualified", False),
-            disqualify_reason=bidder_data.get("disqualify_reason"),
-            criterion_scores_json=bidder_data.get("criterion_scores"),
-            rationale=bidder_data.get("rationale"),
-        )
-        db.add(score_record)
+    prompt = f"""You are an expert procurement officer evaluating bidders for a tender. 
+Here are the exact tender criteria:
+{criteria_text}
 
+Here is the data submitted by each bidder (text extracted from their documents):
+{all_bidders_text}
+
+Task:
+1. Evaluate all the bidders against the criteria. 
+2. Clearly state which bidder is the BEST and WHY. 
+3. Summarize your findings in a simple, clean, and easy-to-read format. 
+4. Avoid overly technical jargon. Just tell me who wins and why they are the best choice.
+"""
+
+    from google import genai
+    from app.config import settings
+    client = genai.Client(api_key=settings.gemini_api_key)
+    
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        evaluation_result = response.text
+    except Exception as e:
+        evaluation_result = f"Error performing evaluation: {str(e)}"
+
+    # Save the simple result in the tender description
+    tender.description = evaluation_result
     tender.status = "evaluated"
     await db.flush()
 
     return {
         "tender_id": tender_id,
         "status": "evaluated",
-        "total_bidders": ranking_result["total_bidders"],
-        "eligible_count": ranking_result["eligible_count"],
-        "disqualified_count": ranking_result["disqualified_count"],
-        "message": f"Evaluation complete. {ranking_result['eligible_count']} eligible, {ranking_result['disqualified_count']} disqualified.",
+        "message": "Simple evaluation complete.",
     }
